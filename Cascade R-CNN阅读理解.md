@@ -76,3 +76,238 @@ eg：现有3个训练好的detector串联，它们分别是用阈值0.5/0.6/0.7�
 ### 3. cascade-rcnn的实现和结果
 
 确定的是一个4级结构：1个RPN+3个检测器（阈值分别为0.5/0/6/0.7），实现思路类似于Faster-rcnn第二阶段检测器的第二阶段。
+
+# CascadeRCNN的实现
+
+## 					——基于mmdetection的实现
+
+### 1. init()
+
+是module的构造函数
+
+init()函数将config配置文件中的字典映射成module，将数据进行保存到module的属性中。这些module类都是torch.nn.module的子类。
+
+```python
+# 根据如下的语句，将类——CascadeRCNN作为形参传入了register_module
+@DETECTORS.register_module
+# 参数来自cascade_rcnn_r50_fpn_1x.py
+class CascadeRCNN(BaseDetector, RPNTestMixin):    
+	# module的构造函数    
+    #这些module类都是torch.nn.module的子类
+	# num_stages = 3 backbone=ResNet neck=FPN rpn_head = RPNHead bbox_roi_extractor= 			SingleRoIExtractor bbox_head= SharedFCBBoxHead * 3   
+    #其余的如果没有都默认赋值为None
+	def __init__(self,                 
+				num_stages,                 
+				backbone,                 
+				neck=None,                 
+				rpn_head=None,                 
+				bbox_roi_extractor=None,                 
+				bbox_head=None,                 
+				mask_roi_extractor=None,                 
+				mask_head=None,                 
+				train_cfg=None,                 
+				test_cfg=None,                 
+				pretrained=None):   
+        #判断bbox_roi_extractor，bbox_head是否为None，这2个数据必须要传入
+		assert bbox_roi_extractor is not None        
+		assert bbox_head is not None  
+        #继承之前的对象初始化方法
+		super(CascadeRCNN, self).__init__()  
+      	# 赋值级数 
+       	self.num_stages = num_stages        
+		# 创建backbone组件模型——ResNet实例，在register注册，具体位置在backbones/resnet.py中   
+        #将传入的backbone的数据来初始化一个resnet类实例
+		self.backbone = builder.build_backbone(backbone)        
+		# 创建neck组件模型——FPN实例，在registers注册，具体位置是necks/fpn.py        		
+        # 如果找不到就会报错说：未实现错误        
+		if neck is not None:            
+			self.neck = builder.build_neck(neck)        
+		else:            
+			raise NotImplementedError        
+			# 创建build_head——RPNHead实例，在register注册，具体位置在anchor_heads/rpn_head 
+			if rpn_head is not None:            
+				self.rpn_head = builder.build_head(rpn_head)        
+     		# 创建bbox_roi_extractor——SingleRoIExtractor实例，具体位置是roi_extractors/single_level        
+       		# 创建bbox_heads组件——类型是SharedFCBBoxHead，具体位置是bbox_heads/convfc_bbox_head        
+		if bbox_head is not None:            
+			# bbox_roi_extractor= SingleRoIExtractor            
+            self.bbox_roi_extractor = nn.ModuleList()            
+          	self.bbox_head = nn.ModuleList()            
+         	# 若bbox_roi_extractor不是list，意味着就一个网络，复制num_stages遍构成一个list   
+          	if not isinstance(bbox_roi_extractor, list):                
+            	bbox_roi_extractor = [                    
+                	bbox_roi_extractor for _ in range(num_stages)                
+             	]            
+             # bbox_head是一个list，跳过，否则就复制num_stages次构建成list类型
+          	if not isinstance(bbox_head, list):               
+                bbox_head = [bbox_head for _ in range(num_stages)]   
+         	# 判断三者是否是一致大小
+           	assert len(bbox_roi_extractor) == len(bbox_head) == self.num_stages   
+        	for roi_extractor, head in zip(bbox_roi_extractor, bbox_head):
+                # 创建3级的 bbox_head 和 bbox_roi_extractor，都是nn.ModuleList
+              	self.bbox_roi_extractor.append(                    											builder.build_roi_extractor(roi_extractor))                							self.bbox_head.append(builder.build_head(head))        
+         if mask_head is not None:            
+        	self.mask_roi_extractor = nn.ModuleList()            
+           	self.mask_head = nn.ModuleList()            
+            if not isinstance(mask_roi_extractor, list):                								mask_roi_extractor = [                    
+                	mask_roi_extractor for _ in range(num_stages) 
+            	]            
+        	if not isinstance(mask_head, list):                
+            	mask_head = [mask_head for _ in range(num_stages)]            
+         	assert len(mask_roi_extractor) == len(mask_head) == self.num_stages
+            for roi_extractor, head in zip(mask_roi_extractor, mask_head):
+                self.mask_roi_extractor.append(                    											builder.build_roi_extractor(roi_extractor))                							self.mask_head.append(builder.build_head(head))        
+     	# 赋值train的配置/test的配置        
+     	self.train_cfg = train_cfg        
+     	self.test_cfg = test_cfg        
+        # 初始化这些权值        
+        self.init_weights(pretrained=pretrained)    
+```
+
+### 2. init_weight
+
+```python
+	@property    
+	def with_rpn(self):        
+        return hasattr(self, 'rpn_head') and self.rpn_head is not None    
+    # 初始化权重    
+    def init_weights(self, pretrained=None):        
+        super(CascadeRCNN, self).init_weights(pretrained)
+        self.backbone.init_weights(pretrained=pretrained)        
+        if self.with_neck:            
+            if isinstance(self.neck, nn.Sequential):                
+                for m in self.neck:                    
+                    m.init_weights()            
+         	else:                
+                self.neck.init_weights()        
+   		if self.with_rpn:            
+            self.rpn_head.init_weights()        
+            for i in range(self.num_stages):            
+                if self.with_bbox:                												self.bbox_roi_extractor[i].init_weights()                								self.bbox_head[i].init_weights()            
+   		if self.with_mask:                
+            self.mask_roi_extractor[i].init_weights()   
+            self.mask_head[i].init_weights()    
+```
+
+### 3. extract_feat()
+
+提取特征
+
+```python
+	#提取img特征    
+	def extract_feat(self, img):        
+        # 经过backbone的前向计算        
+        x = self.backbone(img)        
+        # 如果有neck的特征处理，就将提取的特征值传递到neck进行处理        
+        if self.with_neck:            
+            x = self.neck(x)        
+     	return x    
+```
+
+### 4. forward_train()
+
+前向传播训练，也就是实现了层之间的连接。
+
+
+
+```python
+	def forward_train(self,                     															  img,
+                  	  img_meta,
+                      gt_bboxes,
+                  	  gt_labels,
+                  	  gt_bboxes_ignore=None,
+                  	  gt_masks=None,
+                  	  proposals=None): 
+    	#提取特征——通过backbone和neck网络
+    	x = self.extract_feat(img)  
+        #计算loss，包括rpn、bbox、mask
+    	losses = dict()    
+        #如果有rpn网络的，就需要执行rpn网络的训练
+    	if self.with_rpn:            
+            #x为提取出来的特征向量，将特征输入到rpn_head，提取出boundingbox
+            rpn_outs = self.rpn_head(x) 
+            #计算rpn的loss
+            rpn_loss_inputs = rpn_outs + (gt_bboxes, img_meta,                                          self.train_cfg.rpn)            
+            rpn_losses = self.rpn_head.loss(                
+                *rpn_loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)            
+            losses.update(rpn_losses)     
+            #将RPN输出的bbox和相关参数输入到proposal
+            proposal_inputs = rpn_outs + (img_meta, self.test_cfg.rpn)            
+            proposal_list = self.rpn_head.get_bboxes(*proposal_inputs)        
+      	else:            
+            proposal_list = proposals 
+       #三次循环     
+     	for i in range(self.num_stages):  
+            #当前循环次数
+      		self.current_stage = i        
+            #cascade-rcnn的rcnn每次迭代的参数都不一样，0.5-0.6-0.7
+    		rcnn_train_cfg = self.train_cfg.rcnn[i]     
+            #loss值每次循环权重不一样 stage_loss_weights=[1, 0.5, 0.25])
+     		lw = self.train_cfg.stage_loss_weights[i]            
+			
+            # assign gts and sample proposals  
+            #分正负样本分开采集
+        	sampling_results = []            
+        	if self.with_bbox or self.with_mask:                
+            	bbox_assigner = build_assigner(rcnn_train_cfg.assigner)                
+            	bbox_sampler = build_sampler(                    
+                		rcnn_train_cfg.sampler, context=self)                
+            	num_imgs = img.size(0)                
+     			if gt_bboxes_ignore is None:                    
+            		gt_bboxes_ignore = [None for _ in range(num_imgs)]                
+            	#遍历
+            	for j in range(num_imgs):    
+                    #分离正负样本
+                	assign_result = bbox_assigner.assign( 
+                        proposal_list[j], gt_bboxes[j], 
+                        gt_bboxes_ignore[j], gt_labels[j])  
+                    #样本采样
+                    sampling_result = bbox_sampler.sample(assign_result,
+                                                          proposal_list[j],               
+                    									  gt_bboxes[j],                        														gt_labels[j],                   
+                    				feats=[lvl_feat[j][None] for lvl_feat in x])                    		#将采样结果
+                    sampling_results.append(sampling_result) 
+                    
+            # roi pooling 池化过程        
+        	# bbox head forward and loss            
+         	bbox_roi_extractor = self.bbox_roi_extractor[i]            
+            bbox_head = self.bbox_head[i]    
+            
+            rois = bbox2roi([res.bboxes for res in sampling_results])            					bbox_feats = bbox_roi_extractor(x[:bbox_roi_extractor.num_inputs],                                            rois)            
+            cls_score, bbox_pred = bbox_head(bbox_feats)            
+            
+            bbox_targets = bbox_head.get_target(sampling_results, gt_bboxes,                                                gt_labels, rcnn_train_cfg)            
+            loss_bbox = bbox_head.loss(cls_score, bbox_pred, *bbox_targets)  
+            
+            #获得loss_bbox值
+            for name, value in loss_bbox.items():                
+                losses['s{}.{}'.format(i, name)] = (value * lw if                                                    'loss' in name else value)            
+         	
+            # mask head forward and loss            
+         	if self.with_mask:                
+            	mask_roi_extractor = self.mask_roi_extractor[i]                							mask_head = self.mask_head[i]                
+              	pos_rois = bbox2roi(                    
+                        [res.pos_bboxes for res in sampling_results])                					mask_feats = mask_roi_extractor(                    										x[:mask_roi_extractor.num_inputs], pos_rois)                						mask_pred = mask_head(mask_feats)                
+                mask_targets = mask_head.get_target(sampling_results, gt_masks,                                                    rcnn_train_cfg)                
+                pos_labels = torch.cat(                    
+                        [res.pos_gt_labels for res in sampling_results])                				loss_mask = mask_head.loss(mask_pred, mask_targets, pos_labels)                			  for name, value in loss_mask.items():                    
+                    losses['s{}.{}'.format(i, name)] = (value * lw                                                        if 'loss' in name else value) 
+                    
+             # refine bboxes，再更新了proposal_list，此时的proposal和gt的iou更好了          
+            if i < self.num_stages - 1:                
+                pos_is_gts = [res.pos_is_gt for res in sampling_results]                				roi_labels = bbox_targets[0]   # bbox_targets is a tuple                
+                with torch.no_grad():                    
+                    proposal_list = bbox_head.refine_bboxes(                        
+                        rois, roi_labels, bbox_pred, pos_is_gts, img_meta)        
+       return losses    
+```
+大体上思路：input -> backbone -> neck -> head -> cls and ref
+
+forward()的整体实现过程：
+
+- 将输入的图片**提取特征**：backbone ( ResNet ) + neck ( FPN )，是调用函数extract_feat()得到的
+- 根据前一个输出的特征图，去**提取proposal**：rpn_head ( RPNHead )，用rpn_head(x)实现，在调用这个的时候还要用到anchor_head.py中的另一个函数get_bboxs()
+- 根据输入的proposal，先**区分正负样本**，assigners完成样本正负判定；sampler对这些**样本采样**，得到sampling_result，这个是可以送入去进行训练的——**Cascade-RCNN就是这边开始有不同的，经过3次循环，每次循环的IOU阈值是逐渐提高的**
+- 已经获得每个图片的采样之后的正负样本，进行一次RoI Pooling ( SingleRoIExtractor )，将不同大小的框映射成固定大小。
+- 池化之后的结果送到**bbox head——classification+detection**，针对每个框进行classification和bbox的修正。之前rpn为单纯的二分类——前景、背景，这里分为N+1类(类别+背景)。调用的是bbox_head——并且**将优化后的bbox应用到proposal中，并且更新proposal中，则第二次循环就是用的优化过的proposal这是Cascade的另一个优势**
+
