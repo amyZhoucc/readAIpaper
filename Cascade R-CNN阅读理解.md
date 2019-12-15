@@ -208,8 +208,6 @@ class CascadeRCNN(BaseDetector, RPNTestMixin):
 
 前向传播训练，也就是实现了层之间的连接。
 
-
-
 ```python
 	def forward_train(self,                     															  img,
                   	  img_meta,
